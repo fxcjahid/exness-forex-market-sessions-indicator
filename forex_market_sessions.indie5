@@ -1,0 +1,389 @@
+# Forex Market Sessions - Indie indicator for TakeProfit
+# Copyright (c) 2026 [Your Name]
+# Licensed under the MIT License (see the LICENSE file in the repository).
+#
+# The make_schedule() helper is adapted from "3 Trading Sessions" by @dr_jones
+# (MIT License, ported from TradingView's built-in Trading Sessions):
+# https://indie-script.github.io/indicators/3%20Trading%20Sessions/
+
+# indie:lang_version = 5
+from math import isnan
+from datetime import time
+from indie import (
+    IndieError, indicator, param, color, MainContext, Context, Color,
+    Optional, TimeFrame, time_frame_unit, Algorithm,
+)
+from indie.color import rgba
+from indie.schedule import ScheduleRule, Schedule
+from indie.drawings import (
+    Chart, Rectangle, LineSegment, LabelAbs, LabelRel, AbsolutePosition, RelativePosition,
+    callout_position, line_segment_style, vertical_anchor as va, horizontal_anchor as ha,
+)
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def make_schedule(time_str: str, timezone: str) -> Schedule:
+    # Session hours are LOCAL to the city's timezone ("hhmm-hhmm"), so
+    # daylight saving time is handled automatically.
+    if len(time_str) != 9 or time_str[4] != '-':
+        raise IndieError('time must be of pattern "hhmm-hhmm", got: ' + time_str)
+    h_start = int(time_str[0]) * 10 + int(time_str[1])
+    m_start = int(time_str[2]) * 10 + int(time_str[3])
+    h_end = int(time_str[5]) * 10 + int(time_str[6])
+    m_end = int(time_str[7]) * 10 + int(time_str[8])
+    schedule_rule = ScheduleRule(start=time(hour=h_start, minute=m_start), end=time(hour=h_end, minute=m_end))
+    return Schedule(rules=[schedule_rule], timezone=timezone)
+
+
+def make_border(a: AbsolutePosition, b: AbsolutePosition, c: Color, style: int, width: int) -> LineSegment:
+    # style: 1 = solid, 2 = dashed, 3 = dotted
+    if style == 2:
+        return LineSegment(a, b, color=c, line_style=line_segment_style.DASHED, line_width=width)
+    if style == 3:
+        return LineSegment(a, b, color=c, line_style=line_segment_style.DOTTED, line_width=width)
+    return LineSegment(a, b, color=c, line_width=width)
+
+
+def range_text(rng: float, unit: int, tick_size: float, price_precision: int) -> str:
+    # unit: 1 = pips, 2 = points (ticks), 3 = price
+    if tick_size <= 0:
+        return str(round(rng, price_precision))
+    if unit == 2:
+        return str(int(rng / tick_size + 0.5)) + ' pts'
+    if unit == 3:
+        return str(round(rng, price_precision))
+    pip = tick_size
+    if price_precision == 2 or price_precision == 3 or price_precision == 5:
+        pip = tick_size * 10
+    return str(round(rng / pip, 1)) + ' pips'
+
+
+# ---------------------------------------------------------------------
+# One session = one box (start -> now, session low -> session high) + name,
+# plus high/low lines that run on after the session until price touches them
+# ---------------------------------------------------------------------
+class SessionInfo(Algorithm):
+    def __init__(self, ctx: Context, name: str, schedule: Schedule):
+        super().__init__(ctx)
+        self._name = name
+        self._schedule = schedule
+
+        self._active = ctx.new_var(False)
+        self._start = ctx.new_var(0.0)
+        self._hi = ctx.new_var(0.0)
+        self._lo = ctx.new_var(0.0)
+
+        # Fill + four border lines + name label of the current box.
+        self._rect = ctx.new_var(Optional[Rectangle]())
+        self._top = ctx.new_var(Optional[LineSegment]())
+        self._bottom = ctx.new_var(Optional[LineSegment]())
+        self._left = ctx.new_var(Optional[LineSegment]())
+        self._right = ctx.new_var(Optional[LineSegment]())
+        self._label = ctx.new_var(Optional[LabelAbs]())
+        self._sig = ctx.new_var('')
+
+        # Previous session high / low lines.
+        self._hi_line = ctx.new_var(Optional[LineSegment]())
+        self._lo_line = ctx.new_var(Optional[LineSegment]())
+        self._hi_level = ctx.new_var(0.0)
+        self._lo_level = ctx.new_var(0.0)
+        self._hi_alive = ctx.new_var(False)
+        self._lo_alive = ctx.new_var(False)
+
+    def forget_drawings(self) -> None:
+        # Leave the old box on the chart (history) and start fresh.
+        self._rect.set(None)
+        self._top.set(None)
+        self._bottom.set(None)
+        self._left.set(None)
+        self._right.set(None)
+        self._label.set(None)
+        self._sig.set('')
+
+    def erase_drawings(self, chart: Chart) -> None:
+        old_rect = self._rect.get()
+        if old_rect is not None:
+            chart.erase(old_rect.value())
+            self._rect.set(None)
+
+        old_top = self._top.get()
+        if old_top is not None:
+            chart.erase(old_top.value())
+            self._top.set(None)
+
+        old_bottom = self._bottom.get()
+        if old_bottom is not None:
+            chart.erase(old_bottom.value())
+            self._bottom.set(None)
+
+        old_left = self._left.get()
+        if old_left is not None:
+            chart.erase(old_left.value())
+            self._left.set(None)
+
+        old_right = self._right.get()
+        if old_right is not None:
+            chart.erase(old_right.value())
+            self._right.set(None)
+
+        old_label = self._label.get()
+        if old_label is not None:
+            chart.erase(old_label.value())
+            self._label.set(None)
+
+    def update_levels(self, chart: Chart) -> None:
+        # Extend the previous session's high / low lines to the current bar
+        # until price touches them.
+        t0 = self.ctx.time[0]
+
+        if self._hi_alive.get():
+            hi_line = self._hi_line.get()
+            if hi_line is not None:
+                level = self._hi_level.get()
+                hi_line.value().point_b = AbsolutePosition(t0, level)
+                chart.draw(hi_line.value())
+                if self.ctx.high[0] >= level:
+                    self._hi_alive.set(False)
+
+        if self._lo_alive.get():
+            lo_line = self._lo_line.get()
+            if lo_line is not None:
+                level = self._lo_level.get()
+                lo_line.value().point_b = AbsolutePosition(t0, level)
+                chart.draw(lo_line.value())
+                if self.ctx.low[0] <= level:
+                    self._lo_alive.set(False)
+
+    def finish_session(self, chart: Chart, line_color: Color, line_width: int, end_t: float) -> None:
+        # Start the high / low lines of the session that just ended.
+        start_t = self._start.get()
+        hi_level = self._hi.get()
+        lo_level = self._lo.get()
+
+        self._hi_level.set(hi_level)
+        self._lo_level.set(lo_level)
+
+        self._hi_line.set(make_border(AbsolutePosition(start_t, hi_level), AbsolutePosition(end_t, hi_level),
+                                      line_color, 2, line_width))
+        chart.draw(self._hi_line.get().value())
+        self._hi_alive.set(True)
+
+        self._lo_line.set(make_border(AbsolutePosition(start_t, lo_level), AbsolutePosition(end_t, lo_level),
+                                      line_color, 2, line_width))
+        chart.draw(self._lo_line.get().value())
+        self._lo_alive.set(True)
+
+    def calc(self, chart: Chart, enabled: bool, session_color: Color, fill_opacity: float,
+             border_style: int, border_width: int, border_opacity: float,
+             pad_pct: int, show_label: bool, font_size: int, label_position: int, label_gap_pct: int,
+             show_levels: bool, show_range: bool, range_unit: int,
+             tick_size: float, price_precision: int) -> bool:
+        t0 = self.ctx.time[0]
+        border_color = session_color(border_opacity)
+
+        # Move the previous session's lines forward first.
+        if show_levels:
+            self.update_levels(chart)
+
+        in_session = False
+        if enabled:
+            in_session = t0 in self._schedule
+
+        if in_session:
+            # A gap of more than 6 hours since the previous bar means a new session.
+            big_gap = False
+            if not isnan(self.ctx.time[1]):
+                if t0 - self.ctx.time[1] > 21600.0:
+                    big_gap = True
+
+            if (not self._active.get()) or big_gap:
+                if self._active.get() and show_levels:
+                    self.finish_session(chart, border_color, border_width, self.ctx.time[1])
+                self._active.set(True)
+                self._start.set(t0)
+                self._hi.set(self.ctx.high[0])
+                self._lo.set(self.ctx.low[0])
+                self.forget_drawings()
+            else:
+                self._hi.set(max(self._hi.get(), self.ctx.high[0]))
+                self._lo.set(min(self._lo.get(), self.ctx.low[0]))
+
+            # Padding is a share of the session range, so it looks the same
+            # in quiet and in volatile sessions.
+            rng = self._hi.get() - self._lo.get()
+            pad = rng * pad_pct / 100.0
+            top = self._hi.get() + pad
+            bottom = self._lo.get() - pad
+            start_t = self._start.get()
+
+            # Only redraw when the box actually changed (avoids blinking).
+            sig = str(start_t) + '|' + str(t0) + '|' + str(top) + '|' + str(bottom)
+            if sig != self._sig.get():
+                self.erase_drawings(chart)
+
+                p_top_left = AbsolutePosition(start_t, top)
+                p_top_right = AbsolutePosition(t0, top)
+                p_bottom_left = AbsolutePosition(start_t, bottom)
+                p_bottom_right = AbsolutePosition(t0, bottom)
+
+                # Fill only (the border is drawn separately below).
+                self._rect.set(Rectangle(
+                    p_top_left,
+                    p_bottom_right,
+                    line_color=color.BLACK(0.01),
+                    bg_color=session_color(fill_opacity),
+                ))
+                chart.draw(self._rect.get().value())
+
+                self._top.set(make_border(p_top_left, p_top_right, border_color, border_style, border_width))
+                chart.draw(self._top.get().value())
+
+                self._bottom.set(make_border(p_bottom_left, p_bottom_right, border_color, border_style, border_width))
+                chart.draw(self._bottom.get().value())
+
+                self._left.set(make_border(p_top_left, p_bottom_left, border_color, border_style, border_width))
+                chart.draw(self._left.get().value())
+
+                self._right.set(make_border(p_top_right, p_bottom_right, border_color, border_style, border_width))
+                chart.draw(self._right.get().value())
+
+                if show_label:
+                    label_text = self._name
+                    if show_range:
+                        label_text = self._name + ' | ' + range_text(rng, range_unit, tick_size, price_precision)
+
+                    label_t = (start_t + t0) / 2.0
+                    label_callout = callout_position.TOP_RIGHT
+                    if label_position == 1:
+                        label_t = start_t
+                    elif label_position == 3:
+                        label_t = t0
+                        label_callout = callout_position.TOP_LEFT
+
+                    # A fully transparent (alpha 0) background can be drawn with a
+                    # default fill, so a nearly invisible one (1%) is used instead.
+                    self._label.set(LabelAbs(
+                        label_text,
+                        AbsolutePosition(label_t, top + rng * label_gap_pct / 100.0),
+                        bg_color=color.BLACK(0.01),
+                        text_color=session_color,
+                        font_size=font_size,
+                        callout_position=label_callout,
+                    ))
+                    chart.draw(self._label.get().value())
+
+                self._sig.set(sig)
+
+        elif self._active.get():
+            self._active.set(False)
+            if show_levels:
+                self.finish_session(chart, border_color, border_width, t0)
+
+        return in_session
+
+
+# ---------------------------------------------------------------------
+# Indicator
+# ---------------------------------------------------------------------
+@indicator('Forex Market Sessions', overlay_main_pane=True)
+@param.bool('show_sydney', default=True, title='Show Sydney session')
+@param.color('sydney_color', default=color.PURPLE, title='Sydney color')
+@param.bool('show_tokyo', default=True, title='Show Tokyo session')
+@param.color('tokyo_color', default=color.YELLOW, title='Tokyo color')
+@param.bool('show_london', default=True, title='Show London session')
+@param.color('london_color', default=color.BLUE, title='London color')
+@param.bool('show_new_york', default=True, title='Show New York session')
+@param.color('new_york_color', default=rgba(255, 140, 0, 1.0), title='New York color')
+@param.float('fill_opacity', default=0.08, min=0.0, max=1.0, step=0.01, title='Box fill opacity')
+@param.int('border_style', default=3, min=1, max=3, title='Border style (1 = Solid, 2 = Dashed, 3 = Dotted)')
+@param.int('border_width', default=1, min=1, max=5, title='Border width')
+@param.float('border_opacity', default=0.8, min=0.0, max=1.0, step=0.05, title='Border opacity')
+@param.int('box_padding_pct', default=4, min=0, max=30, title='Box padding (% of session range)')
+@param.bool('show_labels', default=True, title='Show session name above box')
+@param.int('label_position', default=2, min=1, max=3, title='Session name position (1 = Left, 2 = Center, 3 = Right)')
+@param.int('label_gap_pct', default=12, min=0, max=100, title='Session name height above box (% of session range)')
+@param.bool('show_range', default=True, title='Show session range in the name')
+@param.int('range_unit', default=1, min=1, max=3, title='Range unit (1 = Pips, 2 = Points, 3 = Price)')
+@param.bool('show_prev_levels', default=True, title='Show previous session high/low lines')
+@param.bool('show_now', default=False, title='Show "Now" panel (sessions running)')
+@param.int('font_size', default=10, min=6, max=24, title='Label font size')
+class Main(MainContext):
+    def __init__(self):
+        if self.time_frame >= TimeFrame(1, time_frame_unit.DAY):
+            raise IndieError('This indicator can only be used on intraday timeframes.')
+
+        # Fixed local session hours; the timezone handles daylight saving.
+        self._syd = SessionInfo(self, 'Sydney', make_schedule('0700-1600', 'Australia/Sydney'))
+        self._tok = SessionInfo(self, 'Tokyo', make_schedule('0900-1800', 'Asia/Tokyo'))
+        self._lon = SessionInfo(self, 'London', make_schedule('0800-1700', 'Europe/London'))
+        self._ny = SessionInfo(self, 'New York', make_schedule('0800-1700', 'America/New_York'))
+
+        # Optional "Now" panel, redrawn only when the running sessions change.
+        none_panel: Optional[LabelRel] = None
+        self._panel = self.new_var(none_panel)
+        self._panel_sig = self.new_var('')
+
+    def calc(self, show_sydney, sydney_color, show_tokyo, tokyo_color,
+             show_london, london_color, show_new_york, new_york_color,
+             fill_opacity, border_style, border_width, border_opacity,
+             box_padding_pct, show_labels, label_position, label_gap_pct, show_range, range_unit,
+             show_prev_levels, show_now, font_size):
+        tick_size = self.info.tick_size
+        price_precision = self.info.price_precision
+
+        in_syd = self._syd.calc(self.chart, show_sydney, sydney_color, fill_opacity,
+                                border_style, border_width, border_opacity,
+                                box_padding_pct, show_labels, font_size, label_position, label_gap_pct,
+                                show_prev_levels, show_range, range_unit, tick_size, price_precision)
+        in_tok = self._tok.calc(self.chart, show_tokyo, tokyo_color, fill_opacity,
+                                border_style, border_width, border_opacity,
+                                box_padding_pct, show_labels, font_size, label_position, label_gap_pct,
+                                show_prev_levels, show_range, range_unit, tick_size, price_precision)
+        in_lon = self._lon.calc(self.chart, show_london, london_color, fill_opacity,
+                                border_style, border_width, border_opacity,
+                                box_padding_pct, show_labels, font_size, label_position, label_gap_pct,
+                                show_prev_levels, show_range, range_unit, tick_size, price_precision)
+        in_ny = self._ny.calc(self.chart, show_new_york, new_york_color, fill_opacity,
+                              border_style, border_width, border_opacity,
+                              box_padding_pct, show_labels, font_size, label_position, label_gap_pct,
+                              show_prev_levels, show_range, range_unit, tick_size, price_precision)
+
+        # ---------- "Now" panel: which sessions are running ----------
+        if show_now and self.is_last_bar:
+            now_text = ''
+            sep = ''
+            if in_syd:
+                now_text += sep + 'Sydney'
+                sep = ' + '
+            if in_tok:
+                now_text += sep + 'Tokyo'
+                sep = ' + '
+            if in_lon:
+                now_text += sep + 'London'
+                sep = ' + '
+            if in_ny:
+                now_text += sep + 'New York'
+                sep = ' + '
+            if now_text == '':
+                now_text = 'No major session'
+            now_text = ' Now: ' + now_text + ' '
+
+            if now_text != self._panel_sig.get():
+                old = self._panel.get()
+                if old is not None:
+                    self.chart.erase(old.value())
+                    self._panel.set(None)
+
+                self._panel.set(LabelRel(
+                    now_text,
+                    RelativePosition(va.TOP, ha.RIGHT, 0.08, 0.98),
+                    bg_color=color.BLACK(0.6),
+                    text_color=color.WHITE,
+                    font_size=font_size + 2,
+                ))
+                self.chart.draw(self._panel.get().value())
+                self._panel_sig.set(now_text)
+
+        return
